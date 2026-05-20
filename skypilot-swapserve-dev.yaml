@@ -1,0 +1,11 @@
+name: slime-dev-on-swapserve
+
+workdir: .
+
+setup: |
+  cd ~/sky_workdir
+  pip install -e . --no-deps
+
+run: |
+  cd ~/sky_workdir
+  echo "SkyPilot dev node is ready at ~/sky_workdir"

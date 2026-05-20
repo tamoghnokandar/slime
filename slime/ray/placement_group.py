@@ -5,6 +5,8 @@ import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from slime.utils.startup_profile import startup_phase
+
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
 
@@ -44,7 +46,8 @@ def _create_placement_group(num_gpus):
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
-    ray.get(pg.ready())
+    with startup_phase("ray_placement_ready"):
+        ray.get(pg.ready())
     # use info actor to get the GPU id
     info_actors = []
     for i in range(num_bundles):
@@ -56,7 +59,8 @@ def _create_placement_group(num_gpus):
                 )
             ).remote()
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    with startup_phase("ray_placement_gpu_map"):
+        gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
     for actor in info_actors:
         ray.kill(actor)
 
@@ -126,12 +130,13 @@ def create_training_models(args, pgs, rollout_manager):
 
         actor_args = parse_megatron_role_args(args, args.megatron_config_path, role="actor")
 
-    actor_model = allocate_train_group(
-        args=actor_args,
-        num_nodes=args.actor_num_nodes,
-        num_gpus_per_node=args.actor_num_gpus_per_node,
-        pg=pgs["actor"],
-    )
+    with startup_phase("megatron_actor_allocate"):
+        actor_model = allocate_train_group(
+            args=actor_args,
+            num_nodes=args.actor_num_nodes,
+            num_gpus_per_node=args.actor_num_gpus_per_node,
+            pg=pgs["actor"],
+        )
 
     critic_model = None
     if args.use_critic:
@@ -142,23 +147,28 @@ def create_training_models(args, pgs, rollout_manager):
             if args.megatron_config_path is not None
             else args
         )
-        critic_model = allocate_train_group(
-            args=critic_args,
-            num_nodes=args.critic_num_nodes,
-            num_gpus_per_node=args.critic_num_gpus_per_node,
-            pg=pgs["critic"],
-            role="critic",
-        )
-        critic_start_rollout_ids = ray.get(critic_model.async_init(critic_model.args, role="critic", with_ref=False))
+        with startup_phase("megatron_critic_allocate"):
+            critic_model = allocate_train_group(
+                args=critic_args,
+                num_nodes=args.critic_num_nodes,
+                num_gpus_per_node=args.critic_num_gpus_per_node,
+                pg=pgs["critic"],
+                role="critic",
+            )
+        with startup_phase("megatron_critic_init_wait"):
+            critic_start_rollout_ids = ray.get(
+                critic_model.async_init(critic_model.args, role="critic", with_ref=False)
+            )
 
-    actor_start_rollout_ids = ray.get(
-        actor_model.async_init(
-            actor_args,
-            role="actor",
-            with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
-            with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
+    with startup_phase("megatron_actor_init_wait"):
+        actor_start_rollout_ids = ray.get(
+            actor_model.async_init(
+                actor_args,
+                role="actor",
+                with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
+                with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
+            )
         )
-    )
     # TODO how to decide rollout start id when critic is involved? For now we just require user to specify it via args.
     if args.use_critic:
         start_rollout_ids = critic_start_rollout_ids

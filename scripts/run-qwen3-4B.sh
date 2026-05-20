@@ -1,14 +1,16 @@
 #!/bin/bash
 
-# for rerun the task
-pkill -9 sglang
-sleep 3
-ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
+if [ "${SLIME_SKIP_STARTUP_CLEANUP:-0}" != "1" ]; then
+    # for rerun the task
+    pkill -9 sglang
+    sleep 3
+    ray stop --force
+    pkill -9 ray
+    pkill -9 python
+    sleep 3
+    pkill -9 ray
+    pkill -9 python
+fi
 
 set -ex
 
@@ -132,14 +134,19 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+if [ "${SLIME_REUSE_RAY:-0}" != "1" ] || ! ray job list --address="http://127.0.0.1:8265" >/dev/null 2>&1; then
+    ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+fi
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"SLIME_STARTUP_PROFILE\": \"${SLIME_STARTUP_PROFILE:-0}\",
+    \"SLIME_STARTUP_NVTX\": \"${SLIME_STARTUP_NVTX:-0}\",
+    \"SLIME_SGLANG_STARTUP_HEALTH_ENDPOINT\": \"${SLIME_SGLANG_STARTUP_HEALTH_ENDPOINT:-}\"
   }
 }"
 

@@ -4,36 +4,43 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.startup_profile import startup_phase
 
 
 def train(args):
     configure_logger()
     # allocate the GPUs
-    pgs = create_placement_groups(args)
+    with startup_phase("ray_placement"):
+        pgs = create_placement_groups(args)
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    with startup_phase("sglang_rollout_startup"):
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
     # Update primary W&B with SGLang metrics endpoint now that servers are up.
     router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
     update_tracking_open_metrics(args, router_addr)
 
     # create the actor and critic models
-    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    with startup_phase("megatron_actor_init"):
+        actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
-        ray.get(rollout_manager.onload_weights.remote())
+        with startup_phase("initial_rollout_onload_weights"):
+            ray.get(rollout_manager.onload_weights.remote())
 
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    with startup_phase("initial_weight_update"):
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     if args.offload_rollout:
-        ray.get(rollout_manager.onload_kv.remote())
+        with startup_phase("initial_rollout_onload_kv"):
+            ray.get(rollout_manager.onload_kv.remote())
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:

@@ -1,19 +1,10 @@
 import os
-import random
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from slime.utils.misc import get_current_node_ip, get_free_port
-from slime.utils.startup_profile import startup_phase
-
-
-@ray.remote(num_cpus=0.01, num_gpus=0)
-class MasterEndpointActor:
-    def get_master_addr_and_port(self):
-        return get_current_node_ip(), get_free_port(start_port=random.randint(20000, 21000))
 
 
 class RayTrainGroup:
@@ -64,8 +55,6 @@ class RayTrainGroup:
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1"),
-            "SLIME_STARTUP_PROFILE": os.environ.get("SLIME_STARTUP_PROFILE", "0"),
-            "SLIME_STARTUP_NVTX": os.environ.get("SLIME_STARTUP_NVTX", "0"),
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.args.train_env_vars,
         }
@@ -73,20 +62,11 @@ class RayTrainGroup:
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 
-            for path in [
-                "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
+            dynlib_path = os.path.join(
+                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
                 "torch_memory_saver_hook_mode_preload.abi3.so",
-            ]:
-                dynlib_path = os.path.join(
-                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                    path,
-                )
-                if os.path.exists(dynlib_path):
-                    break
-            else:
-                raise FileNotFoundError(
-                    "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
-                )
+            )
+            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
 
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
@@ -102,28 +82,21 @@ class RayTrainGroup:
 
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
 
-        with startup_phase(f"megatron_{self.role}_master_endpoint_allocate"):
-            master_endpoint_actor = MasterEndpointActor.options(
+        # Create worker actors
+        self._actor_handlers = []
+        master_addr, master_port = None, None
+        for rank in range(world_size):
+            actor = TrainRayActor.options(
+                num_cpus=num_gpus_per_actor,
+                num_gpus=num_gpus_per_actor,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=reordered_bundle_indices[0],
+                    placement_group_bundle_index=reordered_bundle_indices[rank],
                 ),
-            ).remote()
-            master_addr, master_port = ray.get(master_endpoint_actor.get_master_addr_and_port.remote())
-            ray.kill(master_endpoint_actor)
-
-        with startup_phase(f"megatron_{self.role}_actor_submit"):
-            self._actor_handlers = [
-                TrainRayActor.options(
-                    num_cpus=num_gpus_per_actor,
-                    num_gpus=num_gpus_per_actor,
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=reordered_bundle_indices[rank],
-                    ),
-                ).remote(world_size, rank, master_addr, master_port)
-                for rank in range(world_size)
-            ]
+            ).remote(world_size, rank, master_addr, master_port)
+            if rank == 0:
+                master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
+            self._actor_handlers.append(actor)
 
     def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
         """

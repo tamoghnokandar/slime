@@ -1,0 +1,16 @@
+name: slime-dev
+
+resources:
+  accelerators: A100:2
+  cloud: vast
+  disk_size: 256
+
+workdir: .
+
+setup: |
+  cd /root/sky_workdir
+  pip install -e . --no-deps
+
+run: |
+  cd /root/sky_workdir
+  echo "SkyPilot dev node is ready at /root/sky_workdir"

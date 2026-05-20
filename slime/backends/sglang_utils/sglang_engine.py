@@ -15,6 +15,7 @@ from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
+from slime.utils.startup_profile import startup_phase
 
 logger = logging.getLogger(__name__)
 
@@ -61,31 +62,49 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
-    p.start()
+    with startup_phase("sglang_engine_process_start"):
+        p = multiprocessing.Process(target=launch_server, args=(server_args,))
+        p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:
         return p
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
-    )
+    with startup_phase("sglang_engine_wait_health"):
+        _wait_server_healthy(
+            base_url=server_args.url(),
+            api_key=server_args.api_key,
+            is_process_alive=lambda: p.is_alive(),
+            endpoint=_get_startup_health_endpoint(default="/health"),
+        )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive):
+def _get_startup_health_endpoint(default):
+    endpoint = os.environ.get("SLIME_SGLANG_STARTUP_HEALTH_ENDPOINT") or default
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    if endpoint not in {"/health", "/health_generate"}:
+        raise ValueError(
+            "SLIME_SGLANG_STARTUP_HEALTH_ENDPOINT must be '/health' or '/health_generate', "
+            f"got {endpoint!r}"
+        )
+    return endpoint
+
+
+def _wait_server_healthy(base_url, api_key, is_process_alive, endpoint="/health_generate"):
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
     }
+    request_timeout = float(os.environ.get("SLIME_SGLANG_HEALTH_REQUEST_TIMEOUT", "2"))
+    poll_interval = 0.1
+    max_poll_interval = 1.0
 
     with requests.Session() as session:
         while True:
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(f"{base_url}{endpoint}", headers=headers, timeout=request_timeout)
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -94,7 +113,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             if not is_process_alive():
                 raise Exception("Server process terminated unexpectedly.")
 
-            time.sleep(2)
+            time.sleep(poll_interval)
+            poll_interval = min(max_poll_interval, poll_interval * 2)
 
 
 class SGLangEngine(RayActor):
@@ -143,19 +163,20 @@ class SGLangEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict, external_engine_need_check_fields = _compute_server_args(
-            self.args,
-            self.rank,
-            dist_init_addr,
-            nccl_port,
-            host,
-            port,
-            self.worker_type,
-            disaggregation_bootstrap_port,
-            base_gpu_id=self.base_gpu_id,
-            sglang_overrides=self.sglang_overrides,
-            num_gpus_per_engine=self.num_gpus_per_engine,
-        )
+        with startup_phase("sglang_engine_compute_server_args"):
+            server_args_dict, external_engine_need_check_fields = _compute_server_args(
+                self.args,
+                self.rank,
+                dist_init_addr,
+                nccl_port,
+                host,
+                port,
+                self.worker_type,
+                disaggregation_bootstrap_port,
+                base_gpu_id=self.base_gpu_id,
+                sglang_overrides=self.sglang_overrides,
+                num_gpus_per_engine=self.num_gpus_per_engine,
+            )
 
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
@@ -182,22 +203,34 @@ class SGLangEngine(RayActor):
                     actual_value == expect_value
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
-        _wait_server_healthy(
-            base_url=f"http://{self.server_host}:{self.server_port}",
-            api_key=None,
-            is_process_alive=lambda: True,
-        )
-        actual_server_args = _get_actual_server_args()
-        _sanity_check_server_args(actual_server_args, expect_server_args)
+        with startup_phase("sglang_engine_external_validate"):
+            _wait_server_healthy(
+                base_url=f"http://{self.server_host}:{self.server_port}",
+                api_key=None,
+                is_process_alive=lambda: True,
+                endpoint=_get_startup_health_endpoint(default="/health"),
+            )
+            actual_server_args = _get_actual_server_args()
+            _sanity_check_server_args(actual_server_args, expect_server_args)
+
+        if self.worker_type != "encoder":
+            self._register_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        with startup_phase("sglang_engine_launch_server_process"):
+            self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.worker_type == "encoder":
             return
 
-        if self.node_rank == 0 and self.router_ip and self.router_port:
+        self._register_router(server_args_dict)
+
+    def _register_router(self, server_args_dict):
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+
+        with startup_phase("sglang_engine_router_register"):
             if parse(sglang_router.__version__) <= parse("0.2.1"):
                 assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
                 response = requests.post(

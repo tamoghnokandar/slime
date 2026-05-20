@@ -21,6 +21,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
+from slime.utils.startup_profile import startup_phase
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -57,7 +58,8 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
 
-        init(args)
+        with startup_phase(f"{role}.distributed_init"):
+            init(args)
 
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
@@ -65,11 +67,12 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof = TrainProfiler(args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
-        for i in range(args.num_gpus_per_node):
-            if i == dist.get_rank() % args.num_gpus_per_node:
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
-            dist.barrier(group=get_gloo_group())
+        with startup_phase(f"{role}.hf_config_tokenizer_load"):
+            for i in range(args.num_gpus_per_node):
+                if i == dist.get_rank() % args.num_gpus_per_node:
+                    self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+                dist.barrier(group=get_gloo_group())
 
         dist.barrier(group=get_gloo_group())
 
@@ -78,9 +81,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
-        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-            args, role
-        )
+        with startup_phase(f"{role}.model_optimizer_checkpoint_load"):
+            self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
+                args, role
+            )
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -113,21 +117,26 @@ class MegatronTrainRayActor(TrainRayActor):
             single_tag=None if args.enable_weights_backuper else "actor",
         )
         self._active_model_tag: str | None = "actor"
-        self.weights_backuper.backup("actor")
+        with startup_phase("actor.weights_backup.actor"):
+            self.weights_backuper.backup("actor")
 
         if with_ref:
-            self.load_other_checkpoint("ref", args.ref_load)
+            with startup_phase("actor.ref_checkpoint_load"):
+                self.load_other_checkpoint("ref", args.ref_load)
 
         # Load teacher model for Megatron-based on-policy distillation
         if with_opd_teacher:
-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
+            with startup_phase("actor.teacher_checkpoint_load"):
+                self.load_other_checkpoint("teacher", args.opd_teacher_load)
 
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
-            self.load_other_checkpoint("old_actor", args.load)
+            with startup_phase("actor.old_actor_checkpoint_load"):
+                self.load_other_checkpoint("old_actor", args.load)
             # Create rollout_actor as a copy of current actor
             if args.update_weights_interval == 1:
-                self.weights_backuper.backup("rollout_actor")
+                with startup_phase("actor.weights_backup.rollout_actor"):
+                    self.weights_backuper.backup("rollout_actor")
 
         if self.args.vocab_size is None:
             # Prefer HF config vocab_size (which may include model-native padding)
@@ -603,7 +612,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            with startup_phase("actor.update_weights"):
+                self.weight_updater.update_weights()
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0:

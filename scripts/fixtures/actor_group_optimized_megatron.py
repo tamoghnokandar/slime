@@ -73,20 +73,11 @@ class RayTrainGroup:
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 
-            for path in [
-                "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
+            dynlib_path = os.path.join(
+                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
                 "torch_memory_saver_hook_mode_preload.abi3.so",
-            ]:
-                dynlib_path = os.path.join(
-                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                    path,
-                )
-                if os.path.exists(dynlib_path):
-                    break
-            else:
-                raise FileNotFoundError(
-                    "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
-                )
+            )
+            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
 
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"

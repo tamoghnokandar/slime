@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import random
+import socket
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.startup_profile import startup_phase
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -96,18 +98,23 @@ class ServerGroup:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
-            num_cpus = num_gpus
+            num_gpus = 0 if self.args.rollout_external else 0.2
+            num_cpus = 0.2
 
             # Get the base GPU ID from placement group using gpu_offset.
             gpu_index = self.gpu_offset + i * num_gpu_per_engine
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
+            actor_options = {
+                "num_cpus": num_cpus,
+                "num_gpus": num_gpus,
+            }
+            if not self.args.rollout_external:
+                actor_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                )
 
             env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
                 key: os.environ.get(key, default_val)
@@ -121,15 +128,16 @@ class ServerGroup:
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                     "SLIME_ENABLE_PROFILING": "true",
+                    "SLIME_STARTUP_PROFILE": "0",
+                    "SLIME_STARTUP_NVTX": "0",
+                    "SLIME_SGLANG_STARTUP_HEALTH_ENDPOINT": "",
                 }.items()
             }
+            actor_options["runtime_env"] = {
+                "env_vars": env_vars,
+            }
             rollout_engine = RolloutRayActor.options(
-                num_cpus=num_cpus,
-                num_gpus=num_gpus,
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={
-                    "env_vars": env_vars,
-                },
+                **actor_options,
             ).remote(
                 self.args,
                 rank=global_rank,
@@ -148,30 +156,33 @@ class ServerGroup:
             return [], port_cursors
 
         if self.args.rollout_external:
-            addr_and_ports = _allocate_rollout_engine_addr_and_ports_external(
-                args=self.args, rollout_engines=rollout_engines
-            )
+            with startup_phase(f"sglang_rollout_port_allocate.{self.worker_type}"):
+                addr_and_ports = _allocate_rollout_engine_addr_and_ports_external(
+                    args=self.args, rollout_engines=rollout_engines
+                )
         else:
             # Compute base_port from the maximum cursor across all nodes that
             # this group's engines may land on (conservative: just use global max).
             base_port = max(port_cursors.values()) if port_cursors else 15000
-            addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
-                args=self.args,
-                rollout_engines=rollout_engines,
-                worker_type=self.worker_type,
-                num_gpus_per_engine=self.num_gpus_per_engine,
-                rank_offset=self.rank_offset,
-                base_port=base_port,
-            )
+            with startup_phase(f"sglang_rollout_port_allocate.{self.worker_type}"):
+                addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
+                    args=self.args,
+                    rollout_engines=rollout_engines,
+                    worker_type=self.worker_type,
+                    num_gpus_per_engine=self.num_gpus_per_engine,
+                    rank_offset=self.rank_offset,
+                    base_port=base_port,
+                )
 
-        init_handles = [
-            engine.init.remote(
-                **(addr_and_ports[rank]),
-                router_ip=self.router_ip,
-                router_port=self.router_port,
-            )
-            for rank, engine in rollout_engines
-        ]
+        with startup_phase(f"sglang_rollout_engine_init_submit.{self.worker_type}"):
+            init_handles = [
+                engine.init.remote(
+                    **(addr_and_ports[rank]),
+                    router_ip=self.router_ip,
+                    router_port=self.router_port,
+                )
+                for rank, engine in rollout_engines
+            ]
         return init_handles, port_cursors
 
     def offload(self):
@@ -356,11 +367,13 @@ class RolloutManager:
         self.pg = pg
         self.args = args
 
-        data_source_cls = load_function(self.args.data_source_path)
-        self.data_source = data_source_cls(args)
+        with startup_phase("rollout_data_source_init"):
+            data_source_cls = load_function(self.args.data_source_path)
+            self.data_source = data_source_cls(args)
 
-        self.generate_rollout = load_function(self.args.rollout_function_path)
-        self.eval_generate_rollout = load_function(self.args.eval_function_path)
+        with startup_phase("rollout_function_load"):
+            self.generate_rollout = load_function(self.args.rollout_function_path)
+            self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None
         if self.args.custom_reward_post_process_path is not None:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
@@ -375,8 +388,9 @@ class RolloutManager:
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:
-            init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
+            with startup_phase("sglang_rollout_server_start"):
+                init_http_client(args)
+                self.servers = start_rollout_servers(args, pg)
 
         init_tracking(args, primary=False)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
@@ -830,31 +844,39 @@ def _allocate_rollout_engine_addr_and_ports_normal(
         # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
         # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
         num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+        # Use small ports to prevent ephemeral port between 32768 and 65536.
+        # Also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition.
+        start_port = node_port_cursor.get(node_index, base_port)
+        port_consecutives = []
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+        for _ in range(num_engines_on_this_node):
+            port_consecutives.extend([1, 1])
+            if worker_type == "prefill":
+                port_consecutives.append(1)
 
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+        needs_shared_dist_init_addr = False
+        if _gpus_per_engine > args.num_gpus_per_node:
+            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
+            needs_shared_dist_init_addr = local_rank % num_node_per_engine == 0
+            if needs_shared_dist_init_addr:
+                port_consecutives.append(30 + args.sglang_dp_size)
+        else:
+            port_consecutives.extend([30 + args.sglang_dp_size] * num_engines_on_this_node)
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
+        node_addr, allocated_ports, next_start_port = ray.get(
+            engine._get_current_node_ip_and_free_ports.remote(
+                start_port=start_port,
+                consecutives=port_consecutives,
+            )
+        )
+        node_port_cursor[node_index] = next_start_port
+        port_iter = iter(allocated_ports)
 
-            return addr, port
+        def get_addr():
+            return node_addr
 
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
+        def get_port():
+            return next(port_iter)
 
         for i in range(num_engines_on_this_node):
             current_rank = rank + i
@@ -867,16 +889,15 @@ def _allocate_rollout_engine_addr_and_ports_normal(
                 addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
 
         if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
+            if needs_shared_dist_init_addr:
                 # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+                dist_init_addr = f"{get_addr()}:{get_port()}"
                 for i in range(num_node_per_engine):
                     addr_and_ports.setdefault(rank + i, {})
                     addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
         else:
             for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port()}"
 
     for i, _ in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
@@ -933,11 +954,29 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     )
     process.daemon = True  # Set the process as a daemon
     process.start()
-    # Wait 3 seconds
-    time.sleep(3)
-    assert process.is_alive()
+    with startup_phase("sglang_router_wait_ready"):
+        _wait_router_port_ready(router_ip, router_port, process)
     logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
     return router_ip, router_port
+
+
+def _wait_router_port_ready(router_ip: str, router_port: int, process: multiprocessing.Process) -> None:
+    host = router_ip.strip("[]")
+    deadline = time.perf_counter() + 10
+    last_error = None
+
+    while time.perf_counter() < deadline:
+        if not process.is_alive():
+            raise RuntimeError(f"SGLang router process exited before port became ready: {last_error}")
+
+        try:
+            with socket.create_connection((host, router_port), timeout=0.25):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.1)
+
+    raise TimeoutError(f"Timed out waiting for SGLang router at {router_ip}:{router_port}: {last_error}")
 
 
 def _compute_rollout_offset(args) -> int:
@@ -1042,7 +1081,8 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 group = _make_group(group_cfg, router_ip, router_port)
                 handles, port_cursors = group.start_engines(port_cursors)
                 if handles:
-                    ray.get(handles)
+                    with startup_phase("sglang_rollout_engine_init_wait.encoder"):
+                        ray.get(handles)
                 urls = ray.get([e.get_url.remote() for e in group.engines])
                 encoder_urls.extend(u for u in urls if u is not None)
                 server_groups.append(group)
@@ -1066,7 +1106,8 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 server_groups.append(group)
 
             if non_encoder_handles:
-                ray.get(non_encoder_handles)
+                with startup_phase("sglang_rollout_engine_init_wait.non_encoder"):
+                    ray.get(non_encoder_handles)
         else:
             # No EPD — start all groups in one pass (original path).
             all_init_handles: list = []
@@ -1077,7 +1118,8 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 server_groups.append(group)
 
             if all_init_handles:
-                ray.get(all_init_handles)
+                with startup_phase("sglang_rollout_engine_init_wait"):
+                    ray.get(all_init_handles)
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
