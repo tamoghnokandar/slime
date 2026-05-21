@@ -178,6 +178,35 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     return opt_param_scheduler
 
 
+def setup_model(args: Namespace, role: str = "actor") -> list[DDP]:
+    """Build model(s) and wrap with DDP."""
+    assert not args.moe_use_upcycling
+    assert args.load is not None or args.pretrained_checkpoint is not None
+
+    return get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+
+
+def setup_optimizer_and_scheduler(
+    args: Namespace,
+    model: list[DDP],
+) -> tuple[MegatronOptimizer, OptimizerParamScheduler]:
+    """Construct optimizer and scheduler for an already-built model."""
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
+    config.timers = None
+
+    optimizer = get_megatron_optimizer(
+        config=config,
+        model_chunks=model,
+        use_gloo_process_groups=args.enable_gloo_process_groups,
+    )
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    return optimizer, opt_param_scheduler
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -199,25 +228,8 @@ def setup_model_and_optimizer(
             - The constructed ``MegatronOptimizer`` instance.
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
-    assert not args.moe_use_upcycling
-    assert args.load is not None or args.pretrained_checkpoint is not None
-
-    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
-
-    # Optimizer
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-    config.timers = None
-
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-    )
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    model = setup_model(args, role)
+    optimizer, opt_param_scheduler = setup_optimizer_and_scheduler(args, model)
     return model, optimizer, opt_param_scheduler
 
 
@@ -912,3 +924,60 @@ def initialize_model_and_optimizer(
     clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration
+
+
+def initialize_model_for_deferred_optimizer(args: Namespace, role: str = "actor") -> tuple[list[DDP], int]:
+    """Initialize model weights while deferring optimizer construction and restore."""
+
+    if torch.version.hip:
+        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
+        from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
+
+        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
+        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+
+    model = setup_model(args, role)
+    model[0].role = role
+    clear_memory()
+
+    old_no_load_optim = args.no_load_optim
+    args.no_load_optim = True
+    try:
+        iteration, _ = load_checkpoint(
+            model,
+            None,
+            None,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+    finally:
+        args.no_load_optim = old_no_load_optim
+
+    clear_memory()
+    return model, iteration
+
+
+def initialize_deferred_optimizer(
+    args: Namespace,
+    model: list[DDP],
+    role: str = "actor",
+) -> tuple[MegatronOptimizer, OptimizerParamScheduler, int]:
+    """Build optimizer/scheduler and restore full checkpoint state before training."""
+
+    optimizer, opt_param_scheduler = setup_optimizer_and_scheduler(args, model)
+    reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
+    clear_memory()
+    iteration, _ = load_checkpoint(
+        model,
+        optimizer,
+        opt_param_scheduler,
+        checkpointing_context={},
+        skip_load_to_model_and_opt=False,
+    )
+    if reinit_critic_output_layer:
+        _reinitialize_critic_output_layer(model)
+        if (args.fp16 or args.bf16) and optimizer is not None:
+            optimizer.reload_model_params()
+    clear_memory()
+    return optimizer, opt_param_scheduler, iteration

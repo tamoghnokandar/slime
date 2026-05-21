@@ -10,6 +10,7 @@ from sglang_router.launch_router import RouterArgs
 
 from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
+from slime.utils.checkpoint_utils import is_megatron_checkpoint, validate_defer_optimizer_checkpoint
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
 
@@ -199,6 +200,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--allgather-cp",
                 action="store_true",
                 default=False,
+            )
+            parser.add_argument(
+                "--defer-optimizer-init",
+                action="store_true",
+                default=False,
+                help=(
+                    "Experimental Megatron startup mode: load model weights during actor init, "
+                    "then build and restore optimizer state before the first train/save."
+                ),
             )
 
             return parser
@@ -1589,6 +1599,13 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def _validate_defer_optimizer_init(args):
+    if not args.defer_optimizer_init:
+        return
+
+    validate_defer_optimizer_checkpoint(args.load)
+
+
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
@@ -1642,11 +1659,7 @@ def slime_validate_args(args):
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
     if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
+        if args.load is not None and os.path.exists(args.load) and is_megatron_checkpoint(args.load):
             # If is a Megatron checkpoint, won't use bridge to load hf weight.
             pass
         else:
@@ -1658,7 +1671,7 @@ def slime_validate_args(args):
         if (
             args.load is None
             or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+            or not is_megatron_checkpoint(args.load)
         ):
             args.no_load_optim = True
             args.no_load_rng = True
@@ -1667,6 +1680,8 @@ def slime_validate_args(args):
             if args.ref_ckpt_step is not None:
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
+
+    _validate_defer_optimizer_init(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."

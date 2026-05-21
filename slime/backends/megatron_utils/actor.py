@@ -32,7 +32,14 @@ from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import (
+    forward_only,
+    initialize_deferred_optimizer,
+    initialize_model_and_optimizer,
+    initialize_model_for_deferred_optimizer,
+    save,
+    train,
+)
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
@@ -82,9 +89,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 torch_memory_saver.memory_margin_bytes = x
 
         with startup_phase(f"{role}.model_optimizer_checkpoint_load"):
-            self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-                args, role
-            )
+            if args.defer_optimizer_init:
+                self.model, loaded_rollout_id = initialize_model_for_deferred_optimizer(args, role)
+                self.optimizer = None
+                self.opt_param_scheduler = None
+                self._optimizer_deferred = True
+            else:
+                self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
+                    args, role
+                )
+                self._optimizer_deferred = False
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -284,6 +298,20 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
+    def _ensure_optimizer_loaded(self) -> None:
+        if not getattr(self, "_optimizer_deferred", False):
+            return
+
+        if self._active_model_tag != "actor":
+            self._switch_model("actor")
+        with startup_phase(f"{self.role}.deferred_optimizer_checkpoint_load"):
+            self.optimizer, self.opt_param_scheduler, _ = initialize_deferred_optimizer(
+                self.args,
+                self.model,
+                self.role,
+            )
+        self._optimizer_deferred = False
+
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
             raise ValueError(
@@ -385,6 +413,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             self.wake_up()
+
+        self._ensure_optimizer_loaded()
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
@@ -559,6 +589,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # torch dist may trigger nccl communication during saving.
         if self.args.offload_train:
             self.wake_up()
+
+        self._ensure_optimizer_loaded()
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save

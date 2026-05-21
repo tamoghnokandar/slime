@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 from pathlib import Path
 
 # TODO: may need to copy those 2 functions and do refactoring.
@@ -9,6 +8,8 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
 from slime.utils import megatron_bridge_utils
+
+from slime.utils.checkpoint_utils import is_megatron_checkpoint
 
 try:
     # Here we patch out the `validate_non_overlapping_shards_metadata` in both functions
@@ -103,7 +104,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         load_path
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
-    if _is_megatron_checkpoint(load_path):
+    if is_megatron_checkpoint(load_path):
         return _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
@@ -118,12 +119,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             args=args,
             load_path=load_path,
         )
-
-
-def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
